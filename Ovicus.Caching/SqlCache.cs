@@ -28,71 +28,63 @@ THE SOFTWARE.
 using System;
 using System.Collections.Generic;
 using System.Data.SqlClient;
-using System.IO;
 using System.Runtime.Caching;
-using System.Runtime.Serialization;
-using System.Runtime.Serialization.Formatters.Binary;
 
 namespace Ovicus.Caching
 {
-    public class SqlCache : ObjectCache
-    {
-        private string name;
-        private string connectionString;
-        private string tableName = "Cache"; // Default table name
-        private static readonly TimeSpan OneDay = new TimeSpan(24, 0, 0); // 1 day
+	public class SqlCache : ObjectCache
+	{
+		private static readonly TimeSpan OneDay = new TimeSpan(24, 0, 0); // 1 day
+		private readonly string connectionString;
+		private readonly ISerializer serializer;
+		private readonly string tableName = "Cache"; // Default table name
 
-        public SqlCache(string connectionString) : this("Default", connectionString) { }
+		public SqlCache(string connectionString, ISerializer serializer) : this("Default", connectionString, serializer)
+		{
+		}
 
-        public SqlCache(string name, string connectionString)
-        {
-            if (name == null)
-                throw new ArgumentNullException("name");
+		public SqlCache(string name, string connectionString, ISerializer serializer)
+		{
+			if (name == null)
+				throw new ArgumentNullException("name");
 
-            if (string.IsNullOrEmpty(connectionString))
-                throw new ArgumentException("A valid connection string is required", "connectionString");
+			if (string.IsNullOrEmpty(connectionString))
+				throw new ArgumentException("A valid connection string is required", "connectionString");
 
-            this.connectionString = connectionString;
-            this.name = name;
-        }
+			this.connectionString = connectionString;
+			this.serializer = serializer;
+			Name = name;
+		}
 
-        public SqlCache(string name, string connectionString, string tableName)
-            : this(name, connectionString)
-        {
-            if (string.IsNullOrEmpty(tableName))
-                throw new ArgumentException("A valid name for the cache table should be provided", "tableName");
-            
-            this.tableName = tableName;
-        }
+		public SqlCache(string name, string connectionString, string tableName, ISerializer serializer)
+			: this(name, connectionString, serializer)
+		{
+			if (string.IsNullOrEmpty(tableName))
+				throw new ArgumentException("A valid name for the cache table should be provided", "tableName");
 
-        private static byte[] Serialize(object value)
-        {
-            IFormatter formatter = new BinaryFormatter();
-            MemoryStream stream = new MemoryStream();
-            formatter.Serialize(stream, value);
-            byte[] serializedObj = stream.GetBuffer();
-            stream.Close();
-            return serializedObj;
-        }
+			this.tableName = tableName;
+		}
 
-        private static object Deserialize(byte[] binaryObj)
-        {
-            IFormatter formatter = new BinaryFormatter();
-            MemoryStream stream = new MemoryStream(binaryObj);
-            var obj = formatter.Deserialize(stream);
-            stream.Close();
-            return obj;
-        }
+		public override DefaultCacheCapabilities DefaultCacheCapabilities =>
+			DefaultCacheCapabilities.AbsoluteExpirations | DefaultCacheCapabilities.OutOfProcessProvider;
 
-        private void InsertOrUpdateEntry(string key, object value, CacheItemPolicy policy)
-        {
-            using (SqlConnection con = new SqlConnection(connectionString))
-            {
-                // Add object to cache
-                SqlCommand cmdIns = new SqlCommand();
-                cmdIns.Connection = con;
+		public override string Name { get; }
 
-                const string cmdText = @"MERGE [{0}] as cache
+		public override object this[string key]
+		{
+			get { return Get(key); }
+			set { Set(key, value, DateTime.Now.Add(OneDay)); }
+		}
+
+		private void InsertOrUpdateEntry(string key, object value, CacheItemPolicy policy)
+		{
+			using (var con = new SqlConnection(connectionString))
+			{
+				// Add object to cache
+				var cmdIns = new SqlCommand();
+				cmdIns.Connection = con;
+
+				const string cmdText = @"MERGE [{0}] as cache
                                             USING (VALUES (@Key)) as src ([Key])
                                             ON    (cache.[Key] = src.[Key])
 
@@ -108,347 +100,330 @@ namespace Ovicus.Caching
                                             WHEN NOT MATCHED THEN
                                                 INSERT ([Key], [Value], Created, LastAccess, SlidingExpirationTimeInMinutes, AbsoluteExpirationTime, ObjectType)
                                                 VALUES (@Key, @Value, @Created, @LastAccess, @SlidingExpirationTimeInMinutes, @AbsoluteExpirationTime, @ObjectType) ;";
-                
-                
-                cmdIns.CommandText = string.Format(cmdText, tableName);
 
-                cmdIns.Parameters.AddWithValue("@Key", key);
-                cmdIns.Parameters.AddWithValue("@Created", DateTime.Now);
-                cmdIns.Parameters.AddWithValue("@LastAccess", DateTime.Now);
-                cmdIns.Parameters.AddWithValue("@ObjectType", value.GetType().FullName);
-                cmdIns.Parameters.AddWithValue("@AbsoluteExpirationTime", DBNull.Value);
-                cmdIns.Parameters.AddWithValue("@SlidingExpirationTimeInMinutes", DBNull.Value);
 
-                SetExpirationValues(cmdIns, policy);
+				cmdIns.CommandText = string.Format(cmdText, tableName);
 
-                // Serialize value
-                byte[] serializedObj = Serialize(value);
-                cmdIns.Parameters.AddWithValue("@Value", serializedObj);
+				cmdIns.Parameters.AddWithValue("@Key", key);
+				cmdIns.Parameters.AddWithValue("@Created", DateTime.Now);
+				cmdIns.Parameters.AddWithValue("@LastAccess", DateTime.Now);
+				cmdIns.Parameters.AddWithValue("@ObjectType", value.GetType().FullName);
+				cmdIns.Parameters.AddWithValue("@AbsoluteExpirationTime", DBNull.Value);
+				cmdIns.Parameters.AddWithValue("@SlidingExpirationTimeInMinutes", DBNull.Value);
 
-                con.Open();
-                cmdIns.ExecuteNonQuery();
-            }
-        }
+				SetExpirationValues(cmdIns, policy);
 
-        private void InsertEntry(string key, object value, CacheItemPolicy policy)
-        {
-            using (SqlConnection con = new SqlConnection(connectionString))
-            {
-                // Add object to cache
-                SqlCommand cmdIns = new SqlCommand();
-                cmdIns.Connection = con;
-                
-                const string cmdText = "INSERT INTO {0} ([Key], [Value], Created, LastAccess, SlidingExpirationTimeInMinutes, AbsoluteExpirationTime, ObjectType) " +
-                                       "VALUES (@Key, @Value, @Created, @LastAccess, @SlidingExpirationTimeInMinutes, @AbsoluteExpirationTime, @ObjectType)";
-                cmdIns.CommandText = string.Format(cmdText, tableName);
+				// Serialize value
+				var serializedObj = serializer.Serialize(value);
+				cmdIns.Parameters.AddWithValue("@Value", serializedObj);
 
-                cmdIns.Parameters.AddWithValue("@Key", key);
-                cmdIns.Parameters.AddWithValue("@Created", DateTime.Now);
-                cmdIns.Parameters.AddWithValue("@LastAccess", DateTime.Now);
-                cmdIns.Parameters.AddWithValue("@ObjectType", value.GetType().FullName);
-                cmdIns.Parameters.AddWithValue("@AbsoluteExpirationTime", DBNull.Value);
-                cmdIns.Parameters.AddWithValue("@SlidingExpirationTimeInMinutes", DBNull.Value);
+				con.Open();
+				cmdIns.ExecuteNonQuery();
+			}
+		}
 
-                SetExpirationValues(cmdIns, policy);
+		private void InsertEntry(string key, object value, CacheItemPolicy policy)
+		{
+			using (var con = new SqlConnection(connectionString))
+			{
+				// Add object to cache
+				var cmdIns = new SqlCommand();
+				cmdIns.Connection = con;
 
-                // Serialize value
-                byte[] serializedObj = Serialize(value);
-                cmdIns.Parameters.AddWithValue("@Value", serializedObj);
+				const string cmdText =
+					"INSERT INTO {0} ([Key], [Value], Created, LastAccess, SlidingExpirationTimeInMinutes, AbsoluteExpirationTime, ObjectType) " +
+					"VALUES (@Key, @Value, @Created, @LastAccess, @SlidingExpirationTimeInMinutes, @AbsoluteExpirationTime, @ObjectType)";
+				cmdIns.CommandText = string.Format(cmdText, tableName);
 
-                con.Open();
-                cmdIns.ExecuteNonQuery();
-            }
-        }
+				cmdIns.Parameters.AddWithValue("@Key", key);
+				cmdIns.Parameters.AddWithValue("@Created", DateTime.Now);
+				cmdIns.Parameters.AddWithValue("@LastAccess", DateTime.Now);
+				cmdIns.Parameters.AddWithValue("@ObjectType", value.GetType().FullName);
+				cmdIns.Parameters.AddWithValue("@AbsoluteExpirationTime", DBNull.Value);
+				cmdIns.Parameters.AddWithValue("@SlidingExpirationTimeInMinutes", DBNull.Value);
 
-        private void UpdateEntry(string key, object value, CacheItemPolicy policy)
-        {
-            using (SqlConnection con = new SqlConnection(connectionString))
-            {
-                // Replace (UPDATE) object in DB
-                SqlCommand cmdUpd = new SqlCommand();
-                cmdUpd.Connection = con;
-                
-                const string cmdText = "UPDATE {0} SET [Value]=@Value, Created=@Created, LastAccess=@LastAccess, " +
-                                       "SlidingExpirationTimeInMinutes=@SlidingExpirationTimeInMinutes, AbsoluteExpirationTime=@AbsoluteExpirationTime, " +
-                                       "ObjectType=@ObjectType WHERE [Key] = @Key";
-                cmdUpd.CommandText = string.Format(cmdText, tableName);
+				SetExpirationValues(cmdIns, policy);
 
-                cmdUpd.Parameters.AddWithValue("@Key", key);
-                cmdUpd.Parameters.AddWithValue("@Created", DateTime.Now);
-                cmdUpd.Parameters.AddWithValue("@LastAccess", DateTime.Now);
-                cmdUpd.Parameters.AddWithValue("@ObjectType", value.GetType().FullName);
-                cmdUpd.Parameters.AddWithValue("@AbsoluteExpirationTime", DBNull.Value);
-                cmdUpd.Parameters.AddWithValue("@SlidingExpirationTimeInMinutes", DBNull.Value);
+				// Serialize value
+				var serializedObj = serializer.Serialize(value);
+				cmdIns.Parameters.AddWithValue("@Value", serializedObj);
 
-                SetExpirationValues(cmdUpd, policy);
+				con.Open();
+				cmdIns.ExecuteNonQuery();
+			}
+		}
 
-                // Serialize value
-                byte[] serializedObj = Serialize(value);
-                cmdUpd.Parameters.AddWithValue("@Value", serializedObj);
+		private void UpdateEntry(string key, object value, CacheItemPolicy policy)
+		{
+			using (var con = new SqlConnection(connectionString))
+			{
+				// Replace (UPDATE) object in DB
+				var cmdUpd = new SqlCommand();
+				cmdUpd.Connection = con;
 
-                con.Open();
-                cmdUpd.ExecuteNonQuery();
-            }
-        }
+				const string cmdText = "UPDATE {0} SET [Value]=@Value, Created=@Created, LastAccess=@LastAccess, " +
+				                       "SlidingExpirationTimeInMinutes=@SlidingExpirationTimeInMinutes, AbsoluteExpirationTime=@AbsoluteExpirationTime, " +
+				                       "ObjectType=@ObjectType WHERE [Key] = @Key";
+				cmdUpd.CommandText = string.Format(cmdText, tableName);
 
-        private void SetExpirationValues(SqlCommand cmd, CacheItemPolicy policy)
-        {
-            if (policy.AbsoluteExpiration.Ticks > 0)
-            {
-                cmd.Parameters["@AbsoluteExpirationTime"].Value = policy.AbsoluteExpiration.DateTime;
-            }
-            else if (policy.SlidingExpiration.Ticks > 0)
-            {
-                cmd.Parameters["@SlidingExpirationTimeInMinutes"].Value = policy.SlidingExpiration.TotalMinutes;
-            }
-            else // Set default absolute expiration time
-            {
-                cmd.Parameters["@AbsoluteExpiration"].Value = DateTime.Now.Add(OneDay);
-            }
-        }
+				cmdUpd.Parameters.AddWithValue("@Key", key);
+				cmdUpd.Parameters.AddWithValue("@Created", DateTime.Now);
+				cmdUpd.Parameters.AddWithValue("@LastAccess", DateTime.Now);
+				cmdUpd.Parameters.AddWithValue("@ObjectType", value.GetType().FullName);
+				cmdUpd.Parameters.AddWithValue("@AbsoluteExpirationTime", DBNull.Value);
+				cmdUpd.Parameters.AddWithValue("@SlidingExpirationTimeInMinutes", DBNull.Value);
 
-        public override object AddOrGetExisting(string key, object value, CacheItemPolicy policy, string regionName = null)
-        {
-            var obj = Get(key, regionName); // Try to get existing item
-            if (obj != null) return obj;
-            Set(key, value, policy, regionName); // Insert or Update expired
-            return null;
-        }
+				SetExpirationValues(cmdUpd, policy);
 
-        public override CacheItem AddOrGetExisting(CacheItem value, CacheItemPolicy policy)
-        {
-            var result = AddOrGetExisting(value.Key, value.Value, policy, value.RegionName);
-            return result != null ? new CacheItem(value.Key, result, value.RegionName) : null;
-        }
+				// Serialize value
+				var serializedObj = serializer.Serialize(value);
+				cmdUpd.Parameters.AddWithValue("@Value", serializedObj);
 
-        public override object AddOrGetExisting(string key, object value, DateTimeOffset absoluteExpiration, string regionName = null)
-        {
-            var policy = new CacheItemPolicy();
-            policy.AbsoluteExpiration = absoluteExpiration;
-            return AddOrGetExisting(key, value, policy, regionName);
-        }
+				con.Open();
+				cmdUpd.ExecuteNonQuery();
+			}
+		}
 
-        public override bool Contains(string key, string regionName = null)
-        {
-            return Get(key, regionName) != null;
-        }
+		private void SetExpirationValues(SqlCommand cmd, CacheItemPolicy policy)
+		{
+			if (policy.AbsoluteExpiration.Ticks > 0)
+			{
+				cmd.Parameters["@AbsoluteExpirationTime"].Value = policy.AbsoluteExpiration.DateTime;
+			}
+			else if (policy.SlidingExpiration.Ticks > 0)
+			{
+				cmd.Parameters["@SlidingExpirationTimeInMinutes"].Value = policy.SlidingExpiration.TotalMinutes;
+			}
+			else // Set default absolute expiration time
+			{
+				cmd.Parameters["@AbsoluteExpiration"].Value = DateTime.Now.Add(OneDay);
+			}
+		}
 
-        public override CacheEntryChangeMonitor CreateCacheEntryChangeMonitor(IEnumerable<string> keys, string regionName = null)
-        {
-            return null;
-        }
+		public override object AddOrGetExisting(string key, object value, CacheItemPolicy policy, string regionName = null)
+		{
+			var obj = Get(key, regionName); // Try to get existing item
+			if (obj != null) return obj;
+			Set(key, value, policy, regionName); // Insert or Update expired
+			return null;
+		}
 
-        public override DefaultCacheCapabilities DefaultCacheCapabilities
-        {
-            get
-            {
-                return DefaultCacheCapabilities.AbsoluteExpirations | DefaultCacheCapabilities.OutOfProcessProvider;
-            }
-        }
+		public override CacheItem AddOrGetExisting(CacheItem value, CacheItemPolicy policy)
+		{
+			var result = AddOrGetExisting(value.Key, value.Value, policy, value.RegionName);
+			return result != null ? new CacheItem(value.Key, result, value.RegionName) : null;
+		}
 
-        public override object Get(string key, string regionName = null)
-        {
-            using (SqlConnection con = new SqlConnection(connectionString))
-            {
-                // Try to get object from cache
-                bool validCache = false;
-                SqlCommand cmdSel = new SqlCommand();
-                cmdSel.Connection = con;
-                
-                string cmdText = "SELECT [Value], Created, LastAccess, SlidingExpirationTimeInMinutes, AbsoluteExpirationTime FROM {0} WHERE [Key] = @Key";
-                cmdSel.CommandText = string.Format(cmdText, tableName);
+		public override object AddOrGetExisting(string key, object value, DateTimeOffset absoluteExpiration,
+			string regionName = null)
+		{
+			var policy = new CacheItemPolicy();
+			policy.AbsoluteExpiration = absoluteExpiration;
+			return AddOrGetExisting(key, value, policy, regionName);
+		}
 
-                cmdSel.Parameters.AddWithValue("@Key", key);
-                con.Open();
+		public override bool Contains(string key, string regionName = null)
+		{
+			return Get(key, regionName) != null;
+		}
 
-                var reader = cmdSel.ExecuteReader();
-                if (reader.Read()) // Object exists in cache
-                {
-                    // Check whether chache expired or not
-                    var absExpirationTime = reader["AbsoluteExpirationTime"];
-                    var slidingExpirationMinutes = reader["SlidingExpirationTimeInMinutes"];
+		public override CacheEntryChangeMonitor CreateCacheEntryChangeMonitor(IEnumerable<string> keys,
+			string regionName = null)
+		{
+			return null;
+		}
 
-                    // Check for absolute expiration date
-                    if (absExpirationTime != null)
-                    {
-                        var expiration = (DateTime)absExpirationTime;
-                        var created = (DateTime)reader["Created"];
-                        validCache = DateTime.Now.CompareTo(expiration) < 0;
-                    }
-                    // Check for sliding expiration date
-                    else if (slidingExpirationMinutes != null)
-                    {
-                        var minutes = (long)slidingExpirationMinutes;
-                        var lastAccess = (DateTime)reader["LastAccess"];
-                        validCache = DateTime.Now.CompareTo(lastAccess.AddMinutes(minutes)) < 0;
-                    }
+		public override object Get(string key, string regionName = null)
+		{
+			using (var con = new SqlConnection(connectionString))
+			{
+				// Try to get object from cache
+				var validCache = false;
+				var cmdSel = new SqlCommand();
+				cmdSel.Connection = con;
 
-                    if (validCache) // Object in cache is valid
-                    {
-                        var binaryObj = (byte[])reader["Value"];
+				var cmdText =
+					"SELECT [Value], Created, LastAccess, SlidingExpirationTimeInMinutes, AbsoluteExpirationTime FROM {0} WHERE [Key] = @Key";
+				cmdSel.CommandText = string.Format(cmdText, tableName);
 
-                        if (!reader.IsClosed) reader.Close();
+				cmdSel.Parameters.AddWithValue("@Key", key);
+				con.Open();
 
-                        // Update LastAccess in DB
-                        SqlCommand cmdUpd = new SqlCommand();
-                        cmdUpd.Connection = con;
+				var reader = cmdSel.ExecuteReader();
+				if (reader.Read()) // Object exists in cache
+				{
+					// Check whether chache expired or not
+					var absExpirationTime = reader["AbsoluteExpirationTime"];
+					var slidingExpirationMinutes = reader["SlidingExpirationTimeInMinutes"];
 
-                        cmdText = "UPDATE {0} SET LastAccess=@LastAccess WHERE [Key] = @Key";
-                        cmdUpd.CommandText = string.Format(cmdText, tableName);
+					// Check for absolute expiration date
+					if (absExpirationTime != null)
+					{
+						var expiration = (DateTime) absExpirationTime;
+						var created = (DateTime) reader["Created"];
+						validCache = DateTime.Now.CompareTo(expiration) < 0;
+					}
+					// Check for sliding expiration date
+					else if (slidingExpirationMinutes != null)
+					{
+						var minutes = (long) slidingExpirationMinutes;
+						var lastAccess = (DateTime) reader["LastAccess"];
+						validCache = DateTime.Now.CompareTo(lastAccess.AddMinutes(minutes)) < 0;
+					}
 
-                        cmdUpd.Parameters.AddWithValue("@Key", key);
-                        cmdUpd.Parameters.AddWithValue("@LastAccess", DateTime.Now);
+					if (validCache) // Object in cache is valid
+					{
+						var binaryObj = reader["Value"].ToString();
 
-                        cmdUpd.ExecuteNonQuery();
+						if (!reader.IsClosed) reader.Close();
 
-                        // Deserialize value
-                        return Deserialize(binaryObj);
-                    }
-                }
-            }
-            return null;
-        }
+						// Update LastAccess in DB
+						var cmdUpd = new SqlCommand();
+						cmdUpd.Connection = con;
 
-        public override CacheItem GetCacheItem(string key, string regionName = null)
-        {
-            var obj = Get(key, regionName);
-            return obj != null ? new CacheItem(key, obj, regionName) : null;
-        }
+						cmdText = "UPDATE {0} SET LastAccess=@LastAccess WHERE [Key] = @Key";
+						cmdUpd.CommandText = string.Format(cmdText, tableName);
 
-        public override long GetCount(string regionName = null)
-        {
-            // Count valid (not expired) items in cache
-            using (SqlConnection con = new SqlConnection(connectionString))
-            {
-                SqlCommand cmdSel = new SqlCommand();
-                cmdSel.Connection = con;
+						cmdUpd.Parameters.AddWithValue("@Key", key);
+						cmdUpd.Parameters.AddWithValue("@LastAccess", DateTime.Now);
 
-                const string cmdText = "SELECT COUNT([Key]) FROM {0} WHERE (AbsoluteExpirationTime > GETDATE()) OR (AbsoluteExpirationTime = NULL AND SlidingExpirationTimeInMinutes <> NULL)";
-                cmdSel.CommandText = string.Format(cmdText, tableName);
+						cmdUpd.ExecuteNonQuery();
 
-                con.Open();
+						// Deserialize value
+						return serializer.Deserialize(binaryObj);
+					}
+				}
+			}
+			return null;
+		}
 
-                // TODO: Filter items with sliding expiration time
+		public override CacheItem GetCacheItem(string key, string regionName = null)
+		{
+			var obj = Get(key, regionName);
+			return obj != null ? new CacheItem(key, obj, regionName) : null;
+		}
 
-                var count = (long)cmdSel.ExecuteScalar();
-                return count;
-            }
-        }
+		public override long GetCount(string regionName = null)
+		{
+			// Count valid (not expired) items in cache
+			using (var con = new SqlConnection(connectionString))
+			{
+				var cmdSel = new SqlCommand();
+				cmdSel.Connection = con;
 
-        protected override IEnumerator<KeyValuePair<string, object>> GetEnumerator()
-        {
-            // Retrieve valid (not expired) items in cache
-            using (SqlConnection con = new SqlConnection(connectionString))
-            {
-                SqlCommand cmdSel = new SqlCommand();
-                cmdSel.Connection = con;
+				const string cmdText =
+					"SELECT COUNT([Key]) FROM {0} WHERE (AbsoluteExpirationTime > GETDATE()) OR (AbsoluteExpirationTime = NULL AND SlidingExpirationTimeInMinutes <> NULL)";
+				cmdSel.CommandText = string.Format(cmdText, tableName);
 
-                const string cmdText = "SELECT [Key], [Value] FROM {0} WHERE (AbsoluteExpirationTime > GETDATE()) OR (AbsoluteExpirationTime = NULL AND SlidingExpirationTimeInMinutes <> NULL)";
-                cmdSel.CommandText = string.Format(cmdText, tableName);
+				con.Open();
 
-                con.Open();
+				// TODO: Filter items with sliding expiration time
 
-                // TODO: Filter items with sliding expiration time
+				var count = (long) cmdSel.ExecuteScalar();
+				return count;
+			}
+		}
 
-                var reader = cmdSel.ExecuteReader();
-                while (reader.Read())
-                {
-                    yield return new KeyValuePair<string, object>((string)reader["Key"], reader["Value"]);
-                }
-            }
-        }
+		protected override IEnumerator<KeyValuePair<string, object>> GetEnumerator()
+		{
+			// Retrieve valid (not expired) items in cache
+			using (var con = new SqlConnection(connectionString))
+			{
+				var cmdSel = new SqlCommand();
+				cmdSel.Connection = con;
 
-        public override IDictionary<string, object> GetValues(IEnumerable<string> keys, string regionName = null)
-        {
-            Dictionary<string, object> result = new Dictionary<string, object>();
-            foreach (var key in keys)
-            {
-                result[key] = Get(key);
-            }
-            return result;
-        }
+				const string cmdText =
+					"SELECT [Key], [Value] FROM {0} WHERE (AbsoluteExpirationTime > GETDATE()) OR (AbsoluteExpirationTime = NULL AND SlidingExpirationTimeInMinutes <> NULL)";
+				cmdSel.CommandText = string.Format(cmdText, tableName);
 
-        public override string Name
-        {
-            get { return name; }
-        }
+				con.Open();
 
-        public override object Remove(string key, string regionName = null)
-        {
-            var obj = Get(key);
-            Remove(key);
-            return obj;
-        }
+				// TODO: Filter items with sliding expiration time
 
-        private void Remove(string key)
-        {
-            using (SqlConnection con = new SqlConnection(connectionString))
-            {
-                SqlCommand cmdDel = new SqlCommand();
-                cmdDel.Connection = con;
+				var reader = cmdSel.ExecuteReader();
+				while (reader.Read())
+				{
+					yield return new KeyValuePair<string, object>((string) reader["Key"], reader["Value"]);
+				}
+			}
+		}
 
-                const string cmdText = "DELETE FROM {0} WHERE [Key] = @Key";
-                cmdDel.CommandText = string.Format(cmdText, tableName);
+		public override IDictionary<string, object> GetValues(IEnumerable<string> keys, string regionName = null)
+		{
+			var result = new Dictionary<string, object>();
+			foreach (var key in keys)
+			{
+				result[key] = Get(key);
+			}
+			return result;
+		}
 
-                cmdDel.Parameters.AddWithValue("@Key", key);
-                con.Open();
-                cmdDel.ExecuteNonQuery();
-            }
-        }
+		public override object Remove(string key, string regionName = null)
+		{
+			var obj = Get(key);
+			Remove(key);
+			return obj;
+		}
 
-        public override void Set(string key, object value, CacheItemPolicy policy, string regionName = null)
-        {
-            #region No Thread-Safe Code
-            //if (Contains(key, regionName)) UpdateEntry(key, value, policy);
-            //else InsertEntry(key, value, policy); 
-            #endregion
+		private void Remove(string key)
+		{
+			using (var con = new SqlConnection(connectionString))
+			{
+				var cmdDel = new SqlCommand();
+				cmdDel.Connection = con;
 
-            // Thread-Safe (requires SQL Server 2008 or higher as uses a MERGE command)
-            InsertOrUpdateEntry(key, value, policy);
-        }
+				const string cmdText = "DELETE FROM {0} WHERE [Key] = @Key";
+				cmdDel.CommandText = string.Format(cmdText, tableName);
 
-        public override void Set(CacheItem item, CacheItemPolicy policy)
-        {
-            Set(item.Key, item.Value, policy);
-        }
+				cmdDel.Parameters.AddWithValue("@Key", key);
+				con.Open();
+				cmdDel.ExecuteNonQuery();
+			}
+		}
 
-        public override void Set(string key, object value, DateTimeOffset absoluteExpiration, string regionName = null)
-        {
-            var policy = new CacheItemPolicy();
-            policy.AbsoluteExpiration = absoluteExpiration;
-            Set(key, value, policy, regionName);
-        }
+		public override void Set(string key, object value, CacheItemPolicy policy, string regionName = null)
+		{
+			#region No Thread-Safe Code
 
-        public override object this[string key]
-        {
-            get
-            {
-                return Get(key);
-            }
-            set
-            {
-                Set(key, value, DateTime.Now.Add(OneDay));
-            }
-        }
+			//if (Contains(key, regionName)) UpdateEntry(key, value, policy);
+			//else InsertEntry(key, value, policy); 
 
-        /// <summary>
-        /// Remove expired entries from the cache table
-        /// </summary>
-        public void Flush()
-        {
-            using (SqlConnection con = new SqlConnection(connectionString))
-            {
-                SqlCommand cmdDel = new SqlCommand();
-                cmdDel.Connection = con;
+			#endregion
 
-                // TODO: Remove items with sliding expiration time
-                
-                const string cmdText = "DELETE FROM {0} WHERE (AbsoluteExpirationTime <= GETDATE())";
-                cmdDel.CommandText = string.Format(cmdText, tableName);
+			// Thread-Safe (requires SQL Server 2008 or higher as uses a MERGE command)
+			InsertOrUpdateEntry(key, value, policy);
+		}
 
-                con.Open();
-                cmdDel.ExecuteNonQuery();
-            }
-        }
-    }
+		public override void Set(CacheItem item, CacheItemPolicy policy)
+		{
+			Set(item.Key, item.Value, policy);
+		}
+
+		public override void Set(string key, object value, DateTimeOffset absoluteExpiration, string regionName = null)
+		{
+			var policy = new CacheItemPolicy();
+			policy.AbsoluteExpiration = absoluteExpiration;
+			Set(key, value, policy, regionName);
+		}
+
+		/// <summary>
+		///   Remove expired entries from the cache table
+		/// </summary>
+		public void Flush()
+		{
+			using (var con = new SqlConnection(connectionString))
+			{
+				var cmdDel = new SqlCommand();
+				cmdDel.Connection = con;
+
+				// TODO: Remove items with sliding expiration time
+
+				const string cmdText = "DELETE FROM {0} WHERE (AbsoluteExpirationTime <= GETDATE())";
+				cmdDel.CommandText = string.Format(cmdText, tableName);
+
+				con.Open();
+				cmdDel.ExecuteNonQuery();
+			}
+		}
+	}
 }
